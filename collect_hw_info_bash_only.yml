@@ -1,0 +1,279 @@
+---
+# playbook: collect_hw_info_bash_only.yml
+# 설명: 원격 서버에 아무것도 설치하지 않고 Bash 명령어를 사용하여 하드웨어 정보를 수집합니다.
+#      Bash 스크립트 실행 시 'bash -c'를 사용하여 쉘 호환성 문제를 해결하고,
+#      출력 정제를 더욱 강화했습니다.
+# 사용법: 이 플레이북은 'run_all_hw_bash_only.sh' 스크립트에 의해 자동으로 실행됩니다.
+
+- name: 원격 서버 하드웨어 정보 수집 (Bash 전용, 설치 없음)
+  hosts: all # 인벤토리 파일에 정의된 모든 호스트에 적용됩니다.
+  gather_facts: no # Python이 없으므로 사실 수집을 수행하지 않습니다.
+  become: yes # /sys/class/dmi/id 파일 접근을 위해 root 권한이 필요합니다.
+  ignore_unreachable: yes # <--- 연결 불가능한 호스트를 무시하고 플레이북을 계속 진행합니다.
+
+  tasks:
+    - block:
+        - name: 하드웨어 정보 수집 Bash 스크립트 실행 (기본 권한 상승 시도)
+          ansible.builtin.raw: |
+            #!/bin/bash
+            
+            # 함수: 값 가져와 줄바꿈 제거, 비어있으면 "N/A" 반환 (강화된 정제)
+            get_val_robust() {
+              local cmd_output="$1"
+              # 선행/후행 공백, 탭, 줄바꿈 제거. 모든 비출력 문자 제거.
+              local cleaned_output=$(echo "$cmd_output" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\n')
+              if [ -z "$cleaned_output" ]; then
+                echo "N/A"
+              else
+                echo "$cleaned_output"
+              fi
+            }
+
+            # 함수: /sys/class/dmi/id/ 파일을 통해 정보 추출 (강화된 정제)
+            get_sysfs_info() {
+              local sysfs_file="$1"
+              local value=""
+              if [ -f "/sys/class/dmi/id/$sysfs_file" ]; then
+                # cat 출력에서 선행/후행 공백, 탭, 줄바꿈 제거
+                value=$(cat "/sys/class/dmi/id/$sysfs_file" 2>/dev/null | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\n')
+              fi
+              if [ -z "$value" ]; then
+                echo "N/A"
+              else
+                echo "$value"
+              fi
+            }
+
+            # 호스트명
+            echo "---HOST:$(hostname | tr -d '\n')---"
+            
+            # IP 주소
+            echo "---SECTION:IP_ADDRESSES---"
+            IP_ADDRESSES_COLLECTED=""
+            # 'ip' 명령 사용 (IPv4만, 127.0.0.1 제외, 출력에서 IP만 정확히 추출)
+            # 명령 실행 결과를 임시 변수에 저장하고, 유효한지 확인 후 최종 할당
+            TEMP_IP_OUTPUT=""
+            if command -v ip &> /dev/null; then
+              TEMP_IP_OUTPUT=$(ip -4 a | grep -oP '(?<=inet )\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?!/8)' | grep -v '^127\.0\.0\.1$' | xargs echo)
+            elif command -v ifconfig &> /dev/null; then
+              TEMP_IP_OUTPUT=$(ifconfig | grep -oP '(?:inet addr:|inet )\K\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}' | grep -v '^127\.0\.0\.1$' | xargs echo)
+            fi
+            
+            # 유효한 IP가 수집되었다면 할당, 그렇지 않으면 빈 문자열 유지 (get_val_robust가 N/A로 처리)
+            if [ -n "$TEMP_IP_OUTPUT" ]; then
+                IP_ADDRESSES_COLLECTED="$TEMP_IP_OUTPUT"
+            fi
+            echo "$(get_val_robust "$IP_ADDRESSES_COLLECTED")"
+            
+            # CPU 정보
+            echo "---SECTION:CPU---"
+            CPU_MODEL_COLLECTED="N/A"
+            CPU_LOGICAL_CPUS_COLLECTED="N/A"
+            CPU_CORES_PER_SOCKET_COLLECTED="N/A"
+            CPU_THREADS_PER_CORE_COLLECTED="N/A"
+
+            if command -v lscpu &> /dev/null; then
+              # lscpu가 있는 경우 Model name을 정확히 파싱 (awk로 값만 추출)
+              CPU_MODEL_COLLECTED=$(lscpu | grep "Model name:" | awk -F': ' '{print $2}' | xargs echo)
+              CPU_LOGICAL_CPUS_COLLECTED=$(lscpu | grep "CPU(s):" | awk -F': ' '{print $2}' | head -n 1 | xargs echo)
+              CPU_CORES_PER_SOCKET_COLLECTED=$(lscpu | grep "Core(s) per socket:" | awk -F': ' '{print $2}' | xargs echo)
+              CPU_THREADS_PER_CORE_COLLECTED=$(lscpu | grep "Thread(s) per core:" | awk -F': ' '{print $2}' | xargs echo)
+            else
+              # /proc/cpuinfo에서 모델명 파싱 (grep -oP로 값만 정확히 추출)
+              CPU_MODEL_COLLECTED=$(grep -oP '(?<=model name\t: ).*' /proc/cpuinfo | head -n 1 | xargs echo)
+              CPU_LOGICAL_CPUS_COLLECTED=$(grep "processor" /proc/cpuinfo | wc -l | xargs echo)
+              # Cores/Threads per core는 lscpu 없으면 파악 어려움
+            fi
+            
+            echo "$(get_val_robust "$CPU_MODEL_COLLECTED")"
+            echo "$(get_val_robust "$CPU_LOGICAL_CPUS_COLLECTED")"
+            echo "$(get_val_robust "$CPU_THREADS_PER_CORE_COLLECTED")"
+            
+            # 시스템 벤더, 제품명, 시리얼, 버전 (/sys/class/dmi/id 사용)
+            echo "---SECTION:SYSTEM_INFO---"
+            SYS_MANUFACTURER=$(get_sysfs_info "sys_vendor")
+            SYS_PRODUCT=$(get_sysfs_info "product_name")
+            SYS_SERIAL=$(get_sysfs_info "product_serial")
+            SYS_VERSION=$(get_sysfs_info "product_version")
+            
+            echo "$SYS_MANUFACTURER"
+            echo "$SYS_PRODUCT"
+            echo "$SYS_SERIAL"
+            echo "$SYS_VERSION"
+            
+            # 메인보드 정보 (/sys/class/dmi/id 사용)
+            echo "---SECTION:MAINBOARD---"
+            MB_MANUFACTURER=$(get_sysfs_info "board_vendor")
+            MB_PRODUCT=$(get_sysfs_info "board_name")
+            MB_SERIAL=$(get_sysfs_info "board_serial")
+            MB_VERSION=$(get_sysfs_info "board_version")
+
+            echo "$MB_MANUFACTURER"
+            echo "$MB_PRODUCT"
+            echo "$MB_SERIAL"
+            echo "$MB_VERSION"
+            
+            # BIOS 정보 (/sys/class/dmi/id 사용)
+            echo "---SECTION:BIOS---"
+            BIOS_VENDOR=$(get_sysfs_info "bios_vendor")
+            BIOS_VERSION=$(get_sysfs_info "bios_version")
+
+            echo "$BIOS_VENDOR"
+            echo "$BIOS_VERSION"
+
+            # OS 정보
+            echo "---SECTION:OS_INFO---"
+            OS_NAME_COLLECTED=""
+            OS_VERSION_ID_COLLECTED=""
+            OS_KERNEL_COLLECTED=""
+
+            if [ -f /etc/os-release ]; then
+              OS_NAME_COLLECTED=$(grep '^NAME=' /etc/os-release | cut -d'=' -f2 | tr -d '"' | xargs echo)
+              OS_VERSION_ID_COLLECTED=$(grep '^VERSION_ID=' /etc/os-release | cut -d'=' -f2 | tr -d '"' | xargs echo)
+            fi
+            OS_KERNEL_COLLECTED=$(uname -r | xargs echo)
+            
+            echo "$(get_val_robust "$OS_NAME_COLLECTED")"
+            echo "$(get_val_robust "$OS_VERSION_ID_COLLECTED")"
+            echo "$(get_val_robust "$OS_KERNEL_COLLECTED")"
+            
+            # 메모리 정보 (MB 단위)
+            echo "---SECTION:MEMORY---"
+            MEM_TOTAL_COLLECTED=$(free -m | grep Mem: | awk '{print $2}' | xargs echo)
+            echo "$(get_val_robust "$MEM_TOTAL_COLLECTED")"
+
+          register: hw_raw_output_attempt
+            
+      rescue:
+        - name: 하드웨어 정보 수집 Bash 스크립트 실행 (su 권한 상승 시도)
+          # 권한 상승 방법을 su로 변경하고 다시 시도합니다.
+          ansible.builtin.raw: |
+            #!/bin/bash
+            
+            get_val_robust() {
+              local cmd_output="$1"
+              local cleaned_output=$(echo "$cmd_output" | sed 's/^[ \t]*//;s/[ \t]*$//' | tr -d '\n')
+              if [ -z "$cleaned_output" ]; then
+                echo "N/A"
+              else
+                echo "$cleaned_output"
+              fi
+            }
+
+            get_sysfs_info() {
+              local sysfs_file="$1"
+              local value=""
+              if [ -f "/sys/class/dmi/id/$sysfs_file" ]; then
+                value=$(cat "/sys/class/dmi/id/$sysfs_file" 2>/dev/null | sed 's/^[ \t]*//;s/[ \t]*$//' | tr -d '\n')
+              fi
+              if [ -z "$value" ]; then
+                echo "N/A"
+              else
+                echo "$value"
+              fi
+            }
+
+            echo "---HOST:$(hostname | tr -d '\n')---"
+            
+            echo "---SECTION:IP_ADDRESSES---"
+            IP_ADDRESSES_COLLECTED=""
+            if command -v ip &> /dev/null; then
+              TEMP_IP_OUTPUT=$(ip -4 a | grep -oP '(?<=inet )\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?!/8)' | grep -v '^127\.0\.0\.1$' | xargs echo)
+            elif command -v ifconfig &> /dev/null; then
+              TEMP_IP_OUTPUT=$(ifconfig | grep -oP '(?:inet addr:|inet )\K\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}' | grep -v '^127\.0\.0\.1$' | xargs echo)
+            fi
+            
+            if [ -n "$TEMP_IP_OUTPUT" ]; then
+                IP_ADDRESSES_COLLECTED="$TEMP_IP_OUTPUT"
+            fi
+            echo "$(get_val_robust "$IP_ADDRESSES_COLLECTED")"
+            
+            echo "---SECTION:CPU---"
+            CPU_MODEL_COLLECTED=""
+            CPU_LOGICAL_CPUS_COLLECTED=""
+            CPU_CORES_PER_SOCKET_COLLECTED=""
+            CPU_THREADS_PER_CORE_COLLECTED=""
+
+            if command -v lscpu &> /dev/null; then
+              CPU_MODEL_COLLECTED=$(lscpu | grep "Model name:" | awk -F': ' '{print $2}' | xargs echo)
+              CPU_LOGICAL_CPUS_COLLECTED=$(lscpu | grep "CPU(s):" | awk -F': ' '{print $2}' | head -n 1 | xargs echo)
+              CPU_CORES_PER_SOCKET_COLLECTED=$(lscpu | grep "Core(s) per socket:" | awk -F': ' '{print $2}' | xargs echo)
+              CPU_THREADS_PER_CORE_COLLECTED=$(lscpu | grep "Thread(s) per core:" | awk -F': ' '{print $2}' | xargs echo)
+            else
+              CPU_MODEL_COLLECTED=$(grep "model name" /proc/cpuinfo | head -n 1 | awk -F': ' '{print $2}' | xargs echo)
+              CPU_LOGICAL_CPUS_COLLECTED=$(grep "processor" /proc/cpuinfo | wc -l | xargs echo)
+            fi
+            
+            echo "$(get_val_robust "$CPU_MODEL_COLLECTED")"
+            echo "$(get_val_robust "$CPU_LOGICAL_CPUS_COLLECTED")"
+            echo "$(get_val_robust "$CPU_CORES_PER_SOCKET_COLLECTED")"
+            echo "$(get_val_robust "$CPU_THREADS_PER_CORE_COLLECTED")"
+            
+            echo "---SECTION:SYSTEM_INFO---"
+            SYS_MANUFACTURER=$(get_sysfs_info "sys_vendor")
+            SYS_PRODUCT=$(get_sysfs_info "product_name")
+            SYS_SERIAL=$(get_sysfs_info "product_serial")
+            SYS_VERSION=$(get_sysfs_info "product_version")
+            
+            echo "$SYS_MANUFACTURER"
+            echo "$SYS_PRODUCT"
+            echo "$SYS_SERIAL"
+            echo "$SYS_VERSION"
+            
+            echo "---SECTION:MAINBOARD---"
+            MB_MANUFACTURER=$(get_sysfs_info "board_vendor")
+            MB_PRODUCT=$(get_sysfs_info "board_name")
+            MB_SERIAL=$(get_sysfs_info "board_serial")
+            MB_VERSION=$(get_sysfs_info "board_version")
+
+            echo "$MB_MANUFACTURER"
+            echo "$MB_PRODUCT"
+            echo "$MB_SERIAL"
+            echo "$MB_VERSION"
+            
+            echo "---SECTION:BIOS---"
+            BIOS_VENDOR=$(get_sysfs_info "bios_vendor")
+            BIOS_VERSION=$(get_sysfs_info "bios_version")
+
+            echo "$BIOS_VENDOR"
+            echo "$BIOS_VERSION"
+
+            # OS 정보
+            echo "---SECTION:OS_INFO---"
+            OS_NAME_COLLECTED=""
+            OS_VERSION_ID_COLLECTED=""
+            OS_KERNEL_COLLECTED=""
+
+            if [ -f /etc/os-release ]; then
+              OS_NAME_COLLECTED=$(grep '^NAME=' /etc/os-release | cut -d'=' -f2 | tr -d '"' | xargs echo)
+              OS_VERSION_ID_COLLECTED=$(grep '^VERSION_ID=' /etc/os-release | cut -d'=' -f2 | tr -d '"' | xargs echo)
+            fi
+            OS_KERNEL_COLLECTED=$(uname -r | xargs echo)
+            
+            echo "$(get_val_robust "$OS_NAME_COLLECTED")"
+            echo "$(get_val_robust "$OS_VERSION_ID_COLLECTED")"
+            echo "$(get_val_robust "$OS_KERNEL_COLLECTED")"
+            
+            # 메모리 정보 (MB 단위)
+            echo "---SECTION:MEMORY---"
+            MEM_TOTAL_COLLECTED=$(free -m | grep Mem: | awk '{print $2}' | xargs echo)
+            echo "$(get_val_robust "$MEM_TOTAL_COLLECTED")"
+          register: hw_raw_output_attempt
+          become_method: su # 여기에서 su로 강제 전환합니다.
+
+    - name: 수집된 하드웨어 정보를 최종 변수에 할당
+      ansible.builtin.set_fact:
+        hw_raw_output: "{{ hw_raw_output_attempt }}"
+      when: hw_raw_output_attempt is defined
+
+    - name: 수집된 하드웨어 정보를 로컬 텍스트 파일에 저장
+      ansible.builtin.copy:
+        content: "{{ hw_raw_output.stdout }}"
+        dest: "./fetched_hw_data/{{ inventory_hostname }}_raw_hw.txt"
+      delegate_to: localhost
+      when: hw_raw_output is defined
+
+    - name: 수집된 Raw 하드웨어 정보 디버그 출력
+      ansible.builtin.debug:
+        msg: "Raw HW Output for {{ inventory_hostname }}:\n{{ hw_raw_output.stdout }}"
+      when: hw_raw_output is defined
